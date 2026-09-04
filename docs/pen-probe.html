@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pen Capability Probe — Wacom Cintiq</title>
+<style>
+  :root { color-scheme: light; --bg:#fafaf9; --fg:#1c1917; --mut:#78716c; --line:#e7e5e4;
+          --ok:#15803d; --bad:#b91c1c; --warn:#b45309; --card:#fff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+         background:var(--bg); color:var(--fg); display:flex; height:100vh; overflow:hidden; }
+  #pad { flex:1; background:var(--card); touch-action:none; user-select:none; cursor:crosshair;
+         position:relative; }
+  #pad canvas { position:absolute; inset:0; width:100%; height:100%; }
+  #hint { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+          pointer-events:none; color:var(--mut); font-size:18px; text-align:center; padding:2rem; }
+  aside { width:420px; border-left:1px solid var(--line); overflow-y:auto; padding:16px 18px;
+          background:var(--bg); }
+  h1 { font-size:15px; margin:0 0 4px; letter-spacing:-.01em; }
+  p.sub { margin:0 0 16px; color:var(--mut); font-size:12.5px; }
+  h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut);
+       margin:20px 0 6px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td { padding:3px 0; vertical-align:top; border-bottom:1px solid var(--line); font-size:12.5px; }
+  td.k { color:var(--mut); white-space:nowrap; padding-right:10px; }
+  td.v { text-align:right; font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; }
+  .ok{color:var(--ok);font-weight:600} .bad{color:var(--bad);font-weight:600}
+  .warn{color:var(--warn);font-weight:600} .mut{color:var(--mut)}
+  button { font:inherit; padding:7px 12px; border:1px solid var(--line); background:var(--card);
+           border-radius:7px; cursor:pointer; margin:14px 6px 0 0; }
+  button:hover { border-color:var(--mut); }
+  #verdict { margin-top:14px; padding:10px 12px; border-radius:8px; background:var(--card);
+             border:1px solid var(--line); font-size:12.5px; white-space:pre-wrap;
+             font-family:ui-monospace,Menlo,Consolas,monospace; }
+</style>
+</head>
+<body>
+
+<div id="pad"><canvas id="c"></canvas><div id="hint">Hover, draw, and tilt the pen here.<br>Vary pressure from feather-light to hard.</div></div>
+
+<aside>
+  <h1>Pen Capability Probe</h1>
+  <p class="sub">Standalone. Open in Chrome/Edge on the Cintiq. Nothing is saved or sent — copy the summary into <code>PEN_CAPABILITY_CHECKLIST.md</code>.</p>
+
+  <h2>Device</h2>
+  <table id="t-dev"></table>
+  <h2>Live sample</h2>
+  <table id="t-live"></table>
+  <h2>Observed over session</h2>
+  <table id="t-obs"></table>
+  <h2>Timing</h2>
+  <table id="t-time"></table>
+
+  <button id="copy">Copy summary</button>
+  <button id="reset">Reset</button>
+  <div id="verdict">Waiting for pen input…</div>
+</aside>
+
+<script>
+const pad = document.getElementById('pad'), cv = document.getElementById('c'), hint = document.getElementById('hint');
+const ctx = cv.getContext('2d', { desynchronized: true });
+function fit(){ const r = pad.getBoundingClientRect(), d = devicePixelRatio||1;
+  cv.width = Math.round(r.width*d); cv.height = Math.round(r.height*d); ctx.setTransform(d,0,0,d,0,0); }
+addEventListener('resize', fit); fit();
+
+const N = () => null;
+const S = {
+  rawSupported: 'onpointerrawupdate' in window,
+  rawSeen: 0, moveSeen: 0, coalescedMax: 0, coalescedTotal: 0, coalescedBatches: 0,
+  pointerTypes: new Set(), pressMin: Infinity, pressMax: -Infinity,
+  pressMinContact: Infinity, pressMaxHover: -Infinity,
+  tiltXMin: Infinity, tiltXMax: -Infinity, tiltYMin: Infinity, tiltYMax: -Infinity,
+  tiltNonZero: false, twistNonZero: false, twistSeen: false,
+  hoverSamples: 0, contactSamples: 0, enters: 0, leaves: 0,
+  tsMonotonicOK: null, tsDeltaMax: 0,
+  rateWindow: [], rateHz: null, live: {}
+};
+
+function note(e, viaRaw){
+  if (viaRaw) S.rawSeen++; else S.moveSeen++;
+  S.pointerTypes.add(e.pointerType);
+  const contact = e.buttons !== 0;
+  if (contact) S.contactSamples++; else S.hoverSamples++;
+
+  if (typeof e.pressure === 'number') {
+    S.pressMin = Math.min(S.pressMin, e.pressure);
+    S.pressMax = Math.max(S.pressMax, e.pressure);
+    if (contact) S.pressMinContact = Math.min(S.pressMinContact, e.pressure);
+    else S.pressMaxHover = Math.max(S.pressMaxHover, e.pressure);
+  }
+  if (typeof e.tiltX === 'number') { S.tiltXMin=Math.min(S.tiltXMin,e.tiltX); S.tiltXMax=Math.max(S.tiltXMax,e.tiltX); if(e.tiltX!==0) S.tiltNonZero=true; }
+  if (typeof e.tiltY === 'number') { S.tiltYMin=Math.min(S.tiltYMin,e.tiltY); S.tiltYMax=Math.max(S.tiltYMax,e.tiltY); if(e.tiltY!==0) S.tiltNonZero=true; }
+  if (typeof e.twist === 'number') { S.twistSeen=true; if(e.twist!==0) S.twistNonZero=true; }
+
+  // Is event.timeStamp in the performance.now() timebase? It should be <= now and close to it.
+  const now = performance.now(), d = now - e.timeStamp;
+  if (S.tsMonotonicOK === null) S.tsMonotonicOK = (d >= -1 && d < 1000);
+  else if (!(d >= -1 && d < 1000)) S.tsMonotonicOK = false;
+  S.tsDeltaMax = Math.max(S.tsDeltaMax, d);
+
+  // Sample rate over a 1 s sliding window (contact only — that is the rate that matters).
+  if (contact) { S.rateWindow.push(now);
+    while (S.rateWindow.length && now - S.rateWindow[0] > 1000) S.rateWindow.shift();
+    if (S.rateWindow.length > 3) S.rateHz = S.rateWindow.length; }
+
+  S.live = { type:e.pointerType, x:e.clientX, y:e.clientY, pressure:e.pressure,
+             tiltX:e.tiltX, tiltY:e.tiltY, twist:e.twist, buttons:e.buttons,
+             contact, ts:e.timeStamp, id:e.pointerId, w:e.width, h:e.height };
+}
+
+let drawing = false, last = null;
+function draw(e){
+  if (!drawing) return;
+  const r = cv.getBoundingClientRect(), x = e.clientX-r.left, y = e.clientY-r.top;
+  const p = (typeof e.pressure === 'number' && e.pressure > 0) ? e.pressure : 0.5;
+  if (last){ ctx.strokeStyle='#1c1917'; ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.lineWidth = 0.5 + p*7; ctx.beginPath(); ctx.moveTo(last.x,last.y); ctx.lineTo(x,y); ctx.stroke(); }
+  last = {x,y};
+}
+
+pad.addEventListener('pointerdown', e => { hint.style.display='none'; drawing=true; last=null;
+  pad.setPointerCapture(e.pointerId); note(e,false); draw(e); });
+pad.addEventListener('pointerup',   e => { drawing=false; last=null; note(e,false); });
+pad.addEventListener('pointercancel', e => { drawing=false; last=null; note(e,false); });
+pad.addEventListener('pointerenter', () => S.enters++);
+pad.addEventListener('pointerleave', () => { S.leaves++; drawing=false; last=null; });
+
+pad.addEventListener('pointermove', e => {
+  const co = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+  if (co.length) { S.coalescedMax = Math.max(S.coalescedMax, co.length);
+                   S.coalescedTotal += co.length; S.coalescedBatches++; }
+  note(e,false);
+  if (!S.rawSupported) { for (const c of (co.length?co:[e])) draw(c); } else draw(e);
+});
+
+if (S.rawSupported) pad.addEventListener('pointerrawupdate', e => note(e,true));
+
+// ── rendering ────────────────────────────────────────────────────────────────
+const f = (v,d=2) => (v===null||v===undefined||!isFinite(v)) ? '—' : (+v).toFixed(d);
+const yn = (b,g='yes',b2='no') => b ? '<span class="ok">'+g+'</span>' : '<span class="bad">'+b2+'</span>';
+function rows(el, pairs){ el.innerHTML = pairs.map(([k,v]) =>
+  '<tr><td class="k">'+k+'</td><td class="v">'+v+'</td></tr>').join(''); }
+
+function render(){
+  const L = S.live;
+  rows(document.getElementById('t-dev'), [
+    ['devicePixelRatio', devicePixelRatio],
+    ['screen (CSS px)', screen.width+' × '+screen.height],
+    ['window inner', innerWidth+' × '+innerHeight],
+    ['pointer types seen', [...S.pointerTypes].join(', ') || '—'],
+    ['pen detected', S.pointerTypes.has('pen') ? yn(true) : '<span class="warn">not yet</span>'],
+  ]);
+  rows(document.getElementById('t-live'), [
+    ['pointerType', L.type ?? '—'],
+    ['client x, y', L.x!==undefined ? f(L.x,1)+', '+f(L.y,1) : '—'],
+    ['pressure', f(L.pressure,3)],
+    ['tiltX / tiltY', L.tiltX!==undefined ? L.tiltX+'° / '+L.tiltY+'°' : '—'],
+    ['twist', L.twist ?? '—'],
+    ['buttons', L.buttons ?? '—'],
+    ['state', L.contact===undefined ? '—' : (L.contact?'<span class="ok">contact</span>':'<span class="mut">hover</span>')],
+    ['contact width × height', L.w!==undefined ? f(L.w,1)+' × '+f(L.h,1) : '—'],
+  ]);
+  rows(document.getElementById('t-obs'), [
+    ['pointerrawupdate supported', yn(S.rawSupported)],
+    ['pointerrawupdate events', S.rawSeen],
+    ['pointermove events', S.moveSeen],
+    ['max coalesced / move', S.coalescedMax || '—'],
+    ['mean coalesced / move', S.coalescedBatches ? f(S.coalescedTotal/S.coalescedBatches,2) : '—'],
+    ['<b>sample rate (contact)</b>', S.rateHz ? '<b>'+S.rateHz+' Hz</b>' : '—'],
+    ['pressure range', isFinite(S.pressMin) ? f(S.pressMin,3)+' → '+f(S.pressMax,3) : '—'],
+    ['min pressure on contact', isFinite(S.pressMinContact) ? f(S.pressMinContact,3) : '—'],
+    ['max pressure on hover', isFinite(S.pressMaxHover) ? f(S.pressMaxHover,3) : '—'],
+    ['tiltX range', isFinite(S.tiltXMin) ? S.tiltXMin+'° → '+S.tiltXMax+'°' : '—'],
+    ['tiltY range', isFinite(S.tiltYMin) ? S.tiltYMin+'° → '+S.tiltYMax+'°' : '—'],
+    ['<b>tilt ever non-zero</b>', S.tiltNonZero ? yn(true,'YES') : '<span class="bad">NO — check Windows Ink</span>'],
+    ['twist reported', S.twistSeen ? (S.twistNonZero?yn(true):'<span class="mut">always 0</span>') : '—'],
+    ['hover samples', S.hoverSamples],
+    ['contact samples', S.contactSamples],
+    ['pointerenter / leave', S.enters+' / '+S.leaves],
+  ]);
+  rows(document.getElementById('t-time'), [
+    ['timeStamp in performance.now() base', S.tsMonotonicOK===null ? '—' : yn(S.tsMonotonicOK)],
+    ['max (now − timeStamp)', f(S.tsDeltaMax,2)+' ms'],
+    ['performance.timeOrigin', f(performance.timeOrigin,1)],
+  ]);
+  document.getElementById('verdict').textContent = summary();
+  requestAnimationFrame(render);
+}
+
+function summary(){
+  if (!S.pointerTypes.size) return 'Waiting for pen input…';
+  const w = [];
+  if (!S.pointerTypes.has('pen')) w.push('! No "pen" pointerType seen — driver or Windows Ink may be misconfigured.');
+  if (!S.tiltNonZero && S.contactSamples > 50) w.push('! Tilt always 0 — enable "Use Windows Ink" in Wacom Tablet Properties, else set tilt_supported:false.');
+  if (S.rateHz && S.rateHz < 100) w.push('! Sample rate ' + S.rateHz + ' Hz is below the expected 133-200 Hz.');
+  if (!S.rawSupported) w.push('! pointerrawupdate unsupported — PenInputManager must use getCoalescedEvents().');
+  if (S.tsMonotonicOK === false) w.push('! event.timeStamp is NOT in the performance.now() timebase — clock design needs revisiting.');
+  if (S.hoverSamples === 0 && S.contactSamples > 0) w.push('! No hover samples captured — hover is required by spec section 19.');
+  return [
+    'pointerType(s):      ' + [...S.pointerTypes].join(', '),
+    'pointerrawupdate:    ' + (S.rawSupported ? 'supported (' + S.rawSeen + ' events)' : 'NOT supported'),
+    'sample rate:         ' + (S.rateHz ? S.rateHz + ' Hz' : 'n/a'),
+    'max coalesced/move:  ' + (S.coalescedMax || 'n/a'),
+    'pressure range:      ' + (isFinite(S.pressMin) ? f(S.pressMin,3) + ' -> ' + f(S.pressMax,3) : 'n/a'),
+    'tiltX range:         ' + (isFinite(S.tiltXMin) ? S.tiltXMin + ' -> ' + S.tiltXMax : 'n/a'),
+    'tiltY range:         ' + (isFinite(S.tiltYMin) ? S.tiltYMin + ' -> ' + S.tiltYMax : 'n/a'),
+    'tilt non-zero:       ' + (S.tiltNonZero ? 'YES' : 'NO'),
+    'hover / contact:     ' + S.hoverSamples + ' / ' + S.contactSamples,
+    'enter / leave:       ' + S.enters + ' / ' + S.leaves,
+    'timeStamp timebase:  ' + (S.tsMonotonicOK ? 'performance.now() OK' : 'MISMATCH'),
+    'devicePixelRatio:    ' + devicePixelRatio,
+    'screen:              ' + screen.width + ' x ' + screen.height,
+    '', ...w
+  ].join('\n');
+}
+
+document.getElementById('copy').onclick = () => navigator.clipboard.writeText(summary());
+document.getElementById('reset').onclick = () => location.reload();
+render();
+</script>
+</body>
+</html>
